@@ -1,7 +1,7 @@
 ---
 name: "A → Z Launch checklist (A to Z)"
-about: "Full launch & activation checklist: repo structure, docs, Stripe compliance, deployment, and activation steps. Use this to track activation tasks."
-labels: ["launch", "checklist"]
+about: "Full launch & activation checklist: repo structure, docs, Stripe compliance, deployment, and activation steps."
+labels: ["launch","checklist"]
 assignees: []
 ---
 
@@ -53,7 +53,7 @@ Use this issue to track the complete repository activation, deployment, and comp
 
 ---
 
-## Paste-ready reference (short)
+Paste-ready reference (short)
 
 Repository layout (example):
 ```
