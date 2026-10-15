@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
-# Safer PR merge script
+# Safer PR create + merge helper
 # Requires: gh (GitHub CLI) and jq
 set -euo pipefail
 
-REPO="${1:-Heliodoro-repo/snippets}"      # owner/repo, can be passed as first arg
-BRANCH="${2:-contact-picker/loading-and-contract}"  # branch / PR head ref (second arg)
-MERGE_METHOD="${3:-merge}"                # merge|squash|rebase
-AUTO_YES="${AUTO_YES:-false}"             # set true to skip interactive confirmation
+# CONFIG (override via env or args)
+REPO="${1:-Heliodorof44/snippets}"                 # owner/repo
+BRANCH="${2:-contact-picker/loading-and-contract}" # branch / PR head
+BASE_BRANCH="${BASE_BRANCH:-main}"
+PR_TITLE="${PR_TITLE:-contacts: add loading indicator and typed ActivityResultContract for contact picker}"
+PR_BODY="${PR_BODY:-Adds loading state indicators and encapsulates result parsing into a typed ActivityResultContract.}"
+MERGE_METHOD="${MERGE_METHOD:-merge}"              # merge | squash | rebase
+AUTO_YES="${AUTO_YES:-false}"                      # set true to skip interactive confirmation
+WAIT_FOR_CHECKS="${WAIT_FOR_CHECKS:-true}"         # true|false
+POLL_INTERVAL="${POLL_INTERVAL:-30}"               # seconds between polls
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-40}"                 # how many poll attempts (30*40 = 20 minutes default)
 
 # helpers
 die() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "=> $*"; }
 
-# ensure dependencies
+# deps
 command -v gh >/dev/null || die "gh (GitHub CLI) not found. Install from https://cli.github.com/"
-command -v jq >/dev/null || die "jq not found. Install (e.g., apt-get install jq) or adjust script to use gh --jq."
+command -v jq >/dev/null || die "jq not found. Install it or adapt script to use gh --jq."
 
-# check gh auth
+# auth
 if ! gh auth status --hostname github.com >/dev/null 2>&1; then
   die "gh is not authenticated. Run 'gh auth login' first."
 fi
@@ -24,81 +31,124 @@ fi
 OWNER="${REPO%%/*}"
 REPO_NAME="${REPO#*/}"
 
-info "Fetching PR details for branch '$BRANCH' in repo '$REPO'..."
-PR_JSON="$(gh pr view "$BRANCH" --repo "$REPO" --json number,title,url,mergeable,mergeStateStatus,state,isDraft,headRefOid || true)"
-[ -n "$PR_JSON" ] || die "Failed to fetch PR details (no output). Is the branch/PR correct?"
+info "Repo: $REPO"
+info "Branch: $BRANCH -> base: $BASE_BRANCH"
 
-PR_NUMBER="$(echo "$PR_JSON" | jq -r '.number // empty')"
-PR_TITLE="$(echo "$PR_JSON" | jq -r '.title // empty')"
-PR_URL="$(echo "$PR_JSON" | jq -r '.url // empty')"
-PR_MERGABLE="$(echo "$PR_JSON" | jq -r '.mergeable // empty')"
-PR_MERGESTATE="$(echo "$PR_JSON" | jq -r '.mergeStateStatus // empty')"
-PR_STATE="$(echo "$PR_JSON" | jq -r '.state // empty')"
-PR_IS_DRAFT="$(echo "$PR_JSON" | jq -r '.isDraft // false')"
-HEAD_SHA="$(echo "$PR_JSON" | jq -r '.headRefOid // empty')"
+# find or create PR and get PR number & URL
+PR_NUMBER=""
+PR_URL=""
 
-if [ -z "$PR_NUMBER" ]; then
-  die "No PR found for '$BRANCH' in $REPO (branch may not be a PR head)."
+if gh pr view "$BRANCH" --repo "$REPO" --json number,url >/dev/null 2>&1; then
+  PR_NUMBER="$(gh pr view "$BRANCH" --repo "$REPO" --json number --jq '.number')"
+  PR_URL="$(gh pr view "$BRANCH" --repo "$REPO" --json url --jq '.url')"
+  info "Found existing PR #$PR_NUMBER: $PR_URL"
+else
+  info "No PR found for branch '$BRANCH'. Creating..."
+  gh pr create --repo "$REPO" --base "$BASE_BRANCH" --head "$BRANCH" --title "$PR_TITLE" --body "$PR_BODY" >/dev/null
+  # fetch number & url after create
+  PR_NUMBER="$(gh pr view "$BRANCH" --repo "$REPO" --json number --jq '.number')"
+  PR_URL="$(gh pr view "$BRANCH" --repo "$REPO" --json url --jq '.url')"
+  info "Created PR #$PR_NUMBER: $PR_URL"
 fi
 
-cat <<-EOF
+# sanity checks
+PR_STATE="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state --jq '.state')"
+PR_IS_DRAFT="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json isDraft --jq '.isDraft')"
+PR_MERGABLE="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeable --jq '.mergeable')"
+PR_MERGESTATE="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeStateStatus --jq '.mergeStateStatus')"
 
-PR #$PR_NUMBER: $PR_TITLE
-URL: $PR_URL
-State: $PR_STATE
-Draft: $PR_IS_DRAFT
-Mergeable: $PR_MERGABLE
-Merge state: $PR_MERGESTATE
-Head commit: ${HEAD_SHA:-unknown}
-EOF
+info "PR #$PR_NUMBER state=$PR_STATE draft=$PR_IS_DRAFT mergeable=$PR_MERGABLE mergeState=$PR_MERGESTATE"
 
-# quick sanity checks
 if [ "$PR_STATE" != "OPEN" ]; then
-  die "PR is not open (state=$PR_STATE). Aborting."
+  die "PR #$PR_NUMBER is not open (state=$PR_STATE). Aborting."
 fi
-
-if [ "$PR_IS_DRAFT" = "true" ] || [ "$PR_IS_DRAFT" = "True" ]; then
-  die "PR is a draft. Convert to ready for review before merging."
+if [ "$PR_IS_DRAFT" = "true" ]; then
+  die "PR #$PR_NUMBER is a draft. Mark it ready for review before merging."
 fi
-
-# guard on mergeable/mergeStateStatus (tolerant)
 if echo "$PR_MERGABLE" | grep -iq "CONFLICT"; then
-  die "PR is reported as CONFLICTING. Resolve conflicts before merging."
+  die "PR #$PR_NUMBER has conflicts. Resolve them before merging."
 fi
 
-# prefer mergeStateStatus clean
-if [ -n "$PR_MERGESTATE" ] && ! echo "$PR_MERGESTATE" | grep -iq "^clean$"; then
-  echo "Warning: mergeStateStatus='$PR_MERGESTATE' (not 'clean'). Please inspect check runs and branch protection."
+# determine head SHA
+HEAD_SHA="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid')"
+if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
+  die "Unable to determine head commit for PR #$PR_NUMBER"
 fi
+info "Head commit: $HEAD_SHA"
 
-# show check runs (try gh pr checks, fallback to check-runs API)
-info "Checking CI / check runs for head commit..."
-if gh pr checks "$BRANCH" --repo "$REPO" >/dev/null 2>&1; then
-  gh pr checks "$BRANCH" --repo "$REPO"
-else
-  if [ -n "$HEAD_SHA" ]; then
-    info "Using checks API for commit $HEAD_SHA"
-    gh api -H "Accept: application/vnd.github+json" \
-      "/repos/$OWNER/$REPO_NAME/commits/$HEAD_SHA/check-runs" \
-      --jq '.check_runs[] | {name: .name, status: .status, conclusion: .conclusion}' || true
-  else
-    echo "Cannot determine head commit SHA; please inspect CI manually: $PR_URL"
+# function to check combined state (statuses) and check-runs
+check_ci_state() {
+  local sha="$1"
+  # Combined status ("success", "failure", "pending", "error")
+  local combined
+  combined="$(gh api -H "Accept: application/vnd.github+json" /repos/"$OWNER"/"$REPO_NAME"/commits/"$sha"/status --jq '.state' 2>/dev/null || echo "unknown")"
+
+  # Check-runs summary
+  local checks_json
+  checks_json="$(gh api -H "Accept: application/vnd.github+json" /repos/"$OWNER"/"$REPO_NAME"/commits/"$sha"/check-runs 2>/dev/null || echo '{"check_runs":[]}')"
+  local pending_count
+  pending_count="$(echo "$checks_json" | jq '.check_runs | map(select(.status != "completed")) | length')"
+  local failed_count
+  failed_count="$(echo "$checks_json" | jq '[.check_runs[] | select(.conclusion=="failure" or .conclusion=="cancelled" or .conclusion=="timed_out" or .conclusion=="action_required")] | length')"
+
+  # Decide:
+  # - if failed_count > 0 -> return 2
+  # - if combined == "failure" or "error" -> return 2
+  # - if pending_count > 0 or combined == "pending" -> return 1
+  # - else success -> return 0
+  if [ "$failed_count" -gt 0 ]; then
+    return 2
+  fi
+  if [ "$combined" = "failure" ] || [ "$combined" = "error" ]; then
+    return 2
+  fi
+  if [ "$pending_count" -gt 0 ] || [ "$combined" = "pending" ]; then
+    return 1
+  fi
+  return 0
+}
+
+# Optionally wait for checks
+if [ "$WAIT_FOR_CHECKS" = "true" ]; then
+  info "Polling CI for commit $HEAD_SHA (interval=${POLL_INTERVAL}s, max_attempts=${MAX_ATTEMPTS})..."
+  attempt=0
+  while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
+    attempt=$((attempt+1))
+    if check_ci_state "$HEAD_SHA"; then
+      info "CI checks passed or completed."
+      break
+    else
+      status=$?
+      if [ "$status" -eq 1 ]; then
+        info "CI still running (attempt $attempt/$MAX_ATTEMPTS). Waiting ${POLL_INTERVAL}s..."
+        sleep "$POLL_INTERVAL"
+        continue
+      elif [ "$status" -eq 2 ]; then
+        die "CI checks reported failure. Aborting merge."
+      else
+        die "Unknown CI check result. Aborting."
+      fi
+    fi
+  done
+
+  if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+    die "Timed out waiting for CI checks after $MAX_ATTEMPTS attempts."
   fi
 fi
 
-# interactive confirmation (or auto)
+# confirmation
 if [ "$AUTO_YES" != "true" ]; then
-  read -rp "Proceed to merge PR #$PR_NUMBER into $REPO (method: $MERGE_METHOD)? (y/N) " CONFIRM
-  if [ "${CONFIRM,,}" != "y" ]; then
-    echo "Aborting merge."
-    exit 0
+  read -rp "Proceed to merge PR #$PR_NUMBER ($PR_TITLE) into $BASE_BRANCH using '$MERGE_METHOD'? (y/N) " CONF
+  if [ "${CONF,,}" != "y" ]; then
+    die "User aborted merge."
   fi
 fi
 
-# perform merge
-info "Merging PR #$PR_NUMBER (method=$MERGE_METHOD)..."
+# perform merge using PR number (more robust than branch name)
+info "Merging PR #$PR_NUMBER using method='$MERGE_METHOD'..."
 if gh pr merge "$PR_NUMBER" --repo "$REPO" --"$MERGE_METHOD" --delete-branch; then
-  info "PR merged and branch deleted (if permitted)."
+  info "PR #$PR_NUMBER merged and branch deletion requested (if permitted)."
+  echo "PR URL: $PR_URL"
 else
-  die "gh pr merge failed. Inspect the PR: $PR_URL"
+  die "gh pr merge failed; inspect PR: $PR_URL"
 fi
